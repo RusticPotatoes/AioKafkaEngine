@@ -10,7 +10,7 @@ on:
 
 jobs:
   deploy:
-    runs-on: [self-hosted, "hetzner"]
+    runs-on: ubuntu-latest
     # https://docs.pypi.org/trusted-publishers/using-a-publisher/
     # Specifying a GitHub environment is optional, but strongly encouraged
     environment: release
