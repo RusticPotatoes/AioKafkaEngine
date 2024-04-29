@@ -1,51 +1,61 @@
 import os
 import sys
 
-# Get the path to the parent directory (one folder up from the test file)
-parent_directory = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-print(parent_directory)
-
-# Append the "src" folder to the Python path
-src_folder = os.path.join(parent_directory, "src")
-print(src_folder)
-
-sys.path.append(src_folder)
-
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import pytest
 import asyncio
 
-import pytest
+from src.AioKafkaEngine import ConsumerEngine, ProducerEngine
 
-from AioKafkaEngine.AioKafkaEngine import AioKafkaEngine
+
+@pytest.fixture
+async def consumer_engine():
+    consumer = ConsumerEngine(
+        bootstrap_servers="localhost:9094",
+        group_id="my_group",
+        report_interval=5,
+        queue_size=100,
+    )
+    await consumer.start_engine(["test_topic"])
+    return consumer
+
+
+@pytest.fixture
+async def producer_engine():
+    producer = ProducerEngine(
+        bootstrap_servers="localhost:9094", report_interval=5, queue_size=100
+    )
+    await producer.start_engine("test_topic")
+    return producer
+
+
+async def test_receive(consumer_engine: ConsumerEngine):
+    queue = consumer_engine.get_queue()
+    while not consumer_engine.stop_event.is_set():
+        msg = await queue.get()
+        print("received", msg)
+        queue.task_done()
+
+
+async def test_produce(producer_engine: ProducerEngine):
+    queue = producer_engine.get_queue()
+    for msg in [{"test": "test"}, {"test2": "test"}]:
+        if producer_engine.stop_event.is_set():
+            break
+        print("send", msg)
+        await queue.put(item=msg)
 
 
 @pytest.mark.asyncio
-async def test_main():
-    print("main")
-    bootstrap_servers = ["localhost:9094"]
-    topic = "test_topic"
-    group_id = "test_group"
-    engine = AioKafkaEngine(bootstrap_servers=bootstrap_servers, topic=topic)
-
-    input_msg = {"key": "value"}
-
-    print("start_consumer")
-    await engine.start_consumer(group_id=group_id)
-    print("start_producer")
-    await engine.start_producer()
-
-    await asyncio.gather(*[engine.produce_messages(), engine.consume_messages()])
-
-    print("put msg")
-    await engine.send_queue.put(input_msg)
-
-    print("get_msg")
-    msg = await engine.receive_queue.get()
-
-    assert msg == input_msg
-
-    await asyncio.gather(*[engine.stop_consumer(), engine.stop_producer()])
-
-
-if __name__ == "__main__":
+def test_main(consumer_engine: ConsumerEngine, producer_engine: ProducerEngine):
     loop = asyncio.get_event_loop()
-    loop.run_until_complete(test_main())
+    loop.run_until_complete(
+        asyncio.gather(
+            test_receive(consumer_engine),
+            test_produce(producer_engine),
+            asyncio.sleep(20),  # Allow the engines to run for 5 seconds
+        )
+    )
+    loop.run_until_complete(
+        asyncio.gather(consumer_engine.stop_engine(), producer_engine.stop_engine())
+    )
