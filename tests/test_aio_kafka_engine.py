@@ -47,15 +47,25 @@ async def test_produce(producer_engine: ProducerEngine):
 
 
 @pytest.mark.asyncio
-def test_main(consumer_engine: ConsumerEngine, producer_engine: ProducerEngine):
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(
-        asyncio.gather(
-            test_receive(consumer_engine),
-            test_produce(producer_engine),
-            asyncio.sleep(20),  # Allow the engines to run for 5 seconds
-        )
+async def test_main():
+    producer = ProducerEngine(
+        bootstrap_servers="localhost:9094", report_interval=5, queue_size=100
     )
-    loop.run_until_complete(
-        asyncio.gather(consumer_engine.stop_engine(), producer_engine.stop_engine())
+
+    consumer = ConsumerEngine(
+        bootstrap_servers="localhost:9094",
+        group_id="my_group",
+        report_interval=5,
+        queue_size=100,
     )
+
+    await producer.start_engine("test_topic")
+    await consumer.start_engine(["test_topic"])
+
+    asyncio.create_task(test_receive(consumer))
+    asyncio.create_task(test_produce(producer))
+
+    await asyncio.sleep(20)  # Allow the engines to run for 5 seconds
+
+    await asyncio.gather(consumer.stop_engine(), producer.stop_engine())
+    await asyncio.sleep(1)
