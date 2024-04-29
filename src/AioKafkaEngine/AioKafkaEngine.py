@@ -75,6 +75,9 @@ class ProducerEngine:
         await self.producer.start()
         try:
             while not self.stop_event.is_set():
+                if self.send_queue.empty():
+                    await asyncio.sleep(1)
+                    continue
                 msg = await self.send_queue.get()
                 await self.producer.send(topic=topic, value=msg)
                 self.produce_counter += 1
