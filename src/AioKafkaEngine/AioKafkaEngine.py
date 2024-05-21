@@ -1,154 +1,105 @@
 import asyncio
-import functools
+from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 import json
 import logging
-import time
-import traceback
-from asyncio import Event, Queue
-
-from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 
 logger = logging.getLogger(__name__)
 
 
-def print_traceback(_, error):
-    error_type = type(error)
-    logger.error(
-        {
-            "error_type": error_type.__name__,
-            "error": error,
-        }
-    )
-    tb_str = traceback.format_exc()
-    logger.error(f"{error}, \n{tb_str}")
+class ConsumerEngine:
+    def __init__(
+        self, bootstrap_servers, group_id=None, report_interval=5, queue_size=None
+    ):
+        self.bootstrap_servers = bootstrap_servers
+        self.group_id = group_id
+        self.receive_queue = asyncio.Queue(maxsize=queue_size)
+        self.consumer = None
+        self.stop_event = asyncio.Event()
+        self.consume_counter = 0
+        self.report_interval = report_interval
 
-
-def retry(max_retries=3, retry_delay=5, on_retry=None, on_failure=None):
-    def wrapper(func):
-        @functools.wraps(func)
-        async def wrapped(*args, **kwargs):
-            retry_count = 0
-
-            while retry_count < max_retries:
-                try:
-                    return await func(*args, **kwargs)
-                except Exception as e:
-                    if on_retry:
-                        on_retry(retry_count, e)
-
-                    retry_count += 1
-                    logger.error(f"Error: {e}")
-                    logger.info(f"Retrying ({retry_count}/{max_retries})...")
-                    await asyncio.sleep(retry_delay)  # Add a delay before retrying
-
-            if on_failure:
-                on_failure(retry_count)
-
-            raise RuntimeError(f"Failed after {max_retries} retries")
-
-        return wrapped
-
-    return wrapper
-
-
-def log_speed(
-    counter: int, start_time: float, _queue: Queue, topic: str, interval: int = 15
-) -> tuple[float, int]:
-    # Calculate the time elapsed since the function started
-    delta_time = time.time() - start_time
-
-    # Check if the specified interval has not elapsed yet
-    if delta_time < interval:
-        # Return the original start time and the current counter value
-        return start_time, counter
-
-    # Calculate the processing speed (messages per second)
-    speed = counter / delta_time
-
-    # Log the processing speed and relevant information
-    log_message = (
-        f"{topic=}, qsize={_queue.qsize()}, "
-        f"processed {counter} in {delta_time:.2f} seconds, {speed:.2f} msg/sec"
-    )
-    logger.info(log_message)
-
-    # Return the current time and reset the counter to zero
-    return time.time(), 0
-
-
-@retry(max_retries=3, retry_delay=5, on_failure=print_traceback)
-async def kafka_consumer(topic: str, group: str, bootstrap_servers: list[str]):
-    logger.info(f"Starting consumer, {topic=}, {group=}")
-
-    consumer = AIOKafkaConsumer(
-        topic,
-        bootstrap_servers=bootstrap_servers,
-        group_id=group,
-        value_deserializer=lambda x: json.loads(x.decode("utf-8")),
-        auto_offset_reset="earliest",
-    )
-    await consumer.start()
-    logger.info("Started")
-    return consumer
-
-
-@retry(max_retries=3, retry_delay=5, on_failure=print_traceback)
-async def kafka_producer(bootstrap_servers: list[str]):
-    logger.info(f"Starting producer")
-
-    producer = AIOKafkaProducer(
-        bootstrap_servers=bootstrap_servers,
-        value_serializer=lambda v: json.dumps(v).encode(),
-        acks="all",
-    )
-    await producer.start()
-    logger.info("Started")
-    return producer
-
-
-@retry(max_retries=3, retry_delay=5, on_failure=print_traceback)
-async def receive_messages(
-    consumer: AIOKafkaConsumer,
-    receive_queue: Queue,
-    shutdown_event: Event,
-    batch_size: int = 200,
-):
-    while not shutdown_event.is_set():
-        batch = await consumer.getmany(timeout_ms=1000, max_records=batch_size)
-        for tp, messages in batch.items():
-            logger.info(f"Partition {tp}: {len(messages)} messages")
-            await asyncio.gather(*[receive_queue.put(m.value) for m in messages])
-            logger.info("done")
-            await consumer.commit()
-
-    logger.info("shutdown")
-
-
-@retry(max_retries=3, retry_delay=5, on_failure=print_traceback)
-async def send_messages(
-    topic: str,
-    producer: AIOKafkaProducer,
-    send_queue: Queue,
-    shutdown_event: Event,
-):
-    start_time = time.time()
-    messages_sent = 0
-
-    while not shutdown_event.is_set():
-        start_time, messages_sent = log_speed(
-            counter=messages_sent,
-            start_time=start_time,
-            _queue=send_queue,
-            topic=topic,
+    async def consume_messages(self, topics):
+        self.consumer = AIOKafkaConsumer(
+            *topics,
+            bootstrap_servers=self.bootstrap_servers,
+            value_deserializer=lambda x: json.loads(x.decode("utf-8")),
+            group_id=self.group_id,
+            auto_offset_reset="earliest",
         )
-        if send_queue.empty():
-            await asyncio.sleep(1)
-            continue
+        await self.consumer.start()
+        try:
+            async for msg in self.consumer:
+                await self.receive_queue.put(msg.value)
+                self.consume_counter += 1
+                if self.stop_event.is_set():
+                    break
+        finally:
+            await self.consumer.stop()
 
-        message = await send_queue.get()
-        await producer.send(topic, value=message)
-        send_queue.task_done()
+    async def start_engine(self, topics):
+        asyncio.create_task(self.consume_messages(topics))
+        asyncio.create_task(self.report_stats())
 
-        messages_sent += 1
+    async def stop_engine(self):
+        self.stop_event.set()
+        if self.consumer:
+            await self.consumer.stop()
 
-    logger.info("shutdown")
+    async def report_stats(self):
+        while not self.stop_event.is_set():
+            await asyncio.sleep(self.report_interval)
+            logger.debug(
+                f"Consumed {self.consume_counter} messages in {self.report_interval} seconds {self.consume_counter/self.report_interval} msg/sec"
+            )
+            self.consume_counter = 0
+
+    def get_queue(self):
+        return self.receive_queue
+
+
+class ProducerEngine:
+    def __init__(self, bootstrap_servers, report_interval=5, queue_size=None):
+        self.bootstrap_servers = bootstrap_servers
+        self.send_queue = asyncio.Queue(maxsize=queue_size)
+        self.producer = None
+        self.stop_event = asyncio.Event()
+        self.produce_counter = 0
+        self.report_interval = report_interval
+
+    async def produce_messages(self, topic):
+        self.producer = AIOKafkaProducer(
+            bootstrap_servers=self.bootstrap_servers,
+            value_serializer=lambda v: json.dumps(v).encode(),
+            acks="all",
+        )
+        await self.producer.start()
+        try:
+            while not self.stop_event.is_set():
+                if self.send_queue.empty():
+                    await asyncio.sleep(1)
+                    continue
+                msg = await self.send_queue.get()
+                await self.producer.send(topic=topic, value=msg)
+                self.produce_counter += 1
+        finally:
+            await self.producer.stop()
+
+    async def start_engine(self, topic):
+        asyncio.create_task(self.produce_messages(topic))
+        asyncio.create_task(self.report_stats())
+
+    async def stop_engine(self):
+        self.stop_event.set()
+        if self.producer:
+            await self.producer.stop()
+
+    async def report_stats(self):
+        while not self.stop_event.is_set():
+            await asyncio.sleep(self.report_interval)
+            logger.debug(
+                f"Produced {self.produce_counter} messages in {self.report_interval} seconds {self.produce_counter/self.report_interval} msg/sec"
+            )
+            self.produce_counter = 0
+
+    def get_queue(self):
+        return self.send_queue
